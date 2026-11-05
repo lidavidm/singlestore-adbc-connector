@@ -64,6 +64,7 @@ import (
 	"runtime/cgo"
 	"strings"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/adbc-drivers/driverbase-go/driverbase"
@@ -1024,7 +1025,12 @@ func SingleStoreConnectionCancel(cnxn *C.struct_AdbcConnection, err *C.struct_Ad
 		return C.ADBC_STATUS_INVALID_STATE
 	}
 
-	conn.cancelContext()
+	defer conn.cancelContext()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if e := singlestore.CancelConnection(conn.cnxn, ctx); e != nil {
+		return C.AdbcStatusCode(errToAdbcErr(err, e))
+	}
 	return C.ADBC_STATUS_OK
 }
 
@@ -1453,7 +1459,12 @@ func SingleStoreStatementCancel(stmt *C.struct_AdbcStatement, err *C.struct_Adbc
 		return C.ADBC_STATUS_INVALID_STATE
 	}
 
-	st.cancelContext()
+	defer st.cancelContext()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if e := singlestore.CancelStatement(st.stmt, ctx); e != nil {
+		return C.AdbcStatusCode(errToAdbcErr(err, e))
+	}
 	return C.ADBC_STATUS_OK
 }
 

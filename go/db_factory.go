@@ -17,11 +17,18 @@ package singlestore
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/adbc-drivers/driverbase-go/sqlwrapper"
 	"github.com/apache/arrow-adbc/go/adbc"
@@ -85,6 +92,144 @@ func (f *SingleStoreDBFactory) forceUTCTimezone(dsn string, logger *slog.Logger)
 	return cfg.FormatDSN(), nil
 }
 
+var customTLSOptions = [...]string{"ssl_ca", "sslrootcert", "ssl_cert", "ssl_key"}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// hasCustomTLSOptions returns true if any custom TLS certificate options are provided.
+func hasCustomTLSOptions(opts map[string]string, q url.Values) bool {
+	for _, opt := range customTLSOptions {
+		if opts[opt] != "" || q.Get(opt) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// hasTimeoutOptions returns true if timeout or connect_timeout is provided in opts.
+func hasTimeoutOptions(opts map[string]string) bool {
+	return opts["timeout"] != "" || opts["connect_timeout"] != ""
+}
+
+// normalizeTLSHostname extracts the bare hostname (without port or IPv6 brackets)
+// for TLS ServerName verification.
+func normalizeTLSHostname(addr string) string {
+	if addr == "" || addr == "(" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
+	}
+	return strings.TrimPrefix(strings.TrimSuffix(addr, "]"), "[")
+}
+
+// buildCustomTLSConfig constructs the *tls.Config and registration key for custom CA / client cert options.
+func buildCustomTLSConfig(hostname, requestedTLS, sslCA, sslCert, sslKey string) (string, *tls.Config, error) {
+	hostname = normalizeTLSHostname(hostname)
+	if strings.EqualFold(requestedTLS, "false") || strings.EqualFold(requestedTLS, "disable") ||
+		strings.EqualFold(requestedTLS, "disabled") || strings.EqualFold(requestedTLS, "off") {
+		return "", nil, fmt.Errorf("custom TLS options (ssl_ca, ssl_cert, ssl_key) cannot be used when TLS is disabled (tls=%q)", requestedTLS)
+	}
+
+	var rootCertPool *x509.CertPool
+	if sslCA != "" {
+		caData, err := os.ReadFile(sslCA)
+		if err != nil {
+			return "", nil, fmt.Errorf("failed to read ssl_ca file %q: %w", sslCA, err)
+		}
+		rootCertPool = x509.NewCertPool()
+		if !rootCertPool.AppendCertsFromPEM(caData) {
+			return "", nil, fmt.Errorf("failed to parse root certificates from ssl_ca file %q", sslCA)
+		}
+	}
+
+	var clientCerts []tls.Certificate
+	if sslCert != "" || sslKey != "" {
+		if sslCert == "" || sslKey == "" {
+			return "", nil, fmt.Errorf("both ssl_cert and ssl_key must be provided for client certificate authentication")
+		}
+		cert, err := tls.LoadX509KeyPair(sslCert, sslKey)
+		if err != nil {
+			return "", nil, fmt.Errorf("failed to load client keypair (ssl_cert=%s, ssl_key=%s): %w", sslCert, sslKey, err)
+		}
+		clientCerts = append(clientCerts, cert)
+	}
+
+	tlsConfig := &tls.Config{
+		RootCAs:      rootCertPool,
+		Certificates: clientCerts,
+	}
+
+	switch strings.ToLower(requestedTLS) {
+	case "skip-verify", "required", "require", "preferred", "prefer":
+		tlsConfig.InsecureSkipVerify = true
+	case "verify_ca", "verify-ca":
+		tlsConfig.InsecureSkipVerify = true
+		pool := rootCertPool
+		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			if len(rawCerts) == 0 {
+				return fmt.Errorf("no certificates provided by server")
+			}
+			certs := make([]*x509.Certificate, len(rawCerts))
+			for i, asn1Data := range rawCerts {
+				c, err := x509.ParseCertificate(asn1Data)
+				if err != nil {
+					return fmt.Errorf("failed to parse certificate: %w", err)
+				}
+				certs[i] = c
+			}
+			// When pool is nil (e.g. client certs without custom ssl_ca),
+			// x509.VerifyOptions uses the system root CA pool.
+			opts := x509.VerifyOptions{
+				Roots:         pool,
+				CurrentTime:   time.Now(),
+				Intermediates: x509.NewCertPool(),
+			}
+			for i := 1; i < len(certs); i++ {
+				opts.Intermediates.AddCert(certs[i])
+			}
+			_, err := certs[0].Verify(opts)
+			return err
+		}
+	default:
+		// "true", "verify_full", or unspecified with custom CA: verify CA and hostname
+		tlsConfig.InsecureSkipVerify = false
+		if hostname != "" {
+			tlsConfig.ServerName = hostname
+		}
+	}
+
+	h := sha256.New()
+	h.Write([]byte(sslCA))
+	h.Write([]byte(sslCert))
+	h.Write([]byte(sslKey))
+	h.Write([]byte(hostname))
+	h.Write([]byte(requestedTLS))
+	configKey := fmt.Sprintf("custom_ca_%x", h.Sum(nil)[:8])
+
+	return configKey, tlsConfig, nil
+}
+
+// setupCustomTLS builds and registers a custom *tls.Config with the MySQL driver.
+// It returns the unique registration key to be used in the DSN tls=<key> parameter.
+func setupCustomTLS(hostname, requestedTLS, sslCA, sslCert, sslKey string) (string, error) {
+	configKey, tlsConfig, err := buildCustomTLSConfig(hostname, requestedTLS, sslCA, sslCert, sslKey)
+	if err != nil {
+		return "", err
+	}
+	if err := mysql.RegisterTLSConfig(configKey, tlsConfig); err != nil {
+		return "", fmt.Errorf("failed to register custom TLS config: %w", err)
+	}
+	return configKey, nil
+}
+
 // BuildSingleStoreDSN constructs a SingleStore DSN from the provided options.
 // Handles the following scenarios:
 //  1. SingleStore URI: "mysql://user:pass@host:port/schema?params" → converted to DSN
@@ -104,13 +249,13 @@ func (f *SingleStoreDBFactory) BuildSingleStoreDSN(opts map[string]string) (stri
 
 	// Check if this is a SingleStore URI (mysql://)
 	if strings.HasPrefix(baseURI, "mysql://") {
-		return f.parseToSingleStoreDSN(baseURI, username, password, autocommit)
+		return f.parseToSingleStoreDSN(baseURI, username, password, autocommit, opts)
 	}
 
-	if username == "" && password == "" && autocommit == "" {
+	if username == "" && password == "" && autocommit == "" && !hasCustomTLSOptions(opts, nil) && !hasTimeoutOptions(opts) {
 		return baseURI, nil
 	}
-	return f.buildFromNativeDSN(baseURI, username, password, autocommit)
+	return f.buildFromNativeDSN(baseURI, username, password, autocommit, opts)
 }
 
 // parseToSingleStoreDSN converts a SingleStore URI to SingleStore DSN format.
@@ -119,7 +264,7 @@ func (f *SingleStoreDBFactory) BuildSingleStoreDSN(opts map[string]string) (stri
 //	mysql://root@localhost:3306/demo → root@tcp(localhost:3306)/demo
 //	mysql://user:pass@host/db?charset=utf8mb4 → user:pass@tcp(host:3306)/db?charset=utf8mb4
 //	mysql://user@(/path/to/socket.sock)/db → user@unix(/path/to/socket.sock)/db
-func (f *SingleStoreDBFactory) parseToSingleStoreDSN(singlestoreURI, username, password, autocommit string) (string, error) {
+func (f *SingleStoreDBFactory) parseToSingleStoreDSN(singlestoreURI, username, password, autocommit string, opts map[string]string) (string, error) {
 	u, err := url.Parse(singlestoreURI)
 	if err != nil {
 		return "", fmt.Errorf("invalid SingleStore URI format: %v", err)
@@ -188,6 +333,42 @@ func (f *SingleStoreDBFactory) parseToSingleStoreDSN(singlestoreURI, username, p
 		cfg.Params["autocommit"] = autocommit
 	}
 
+	q := u.Query()
+	if hasCustomTLSOptions(opts, q) {
+		sslCA := firstNonEmpty(opts["ssl_ca"], opts["sslrootcert"], q.Get("ssl_ca"), q.Get("sslrootcert"))
+		sslCert := firstNonEmpty(opts["ssl_cert"], q.Get("ssl_cert"))
+		sslKey := firstNonEmpty(opts["ssl_key"], q.Get("ssl_key"))
+		requestedTLS := firstNonEmpty(q.Get("tls"), opts["ssl_mode"], opts["sslmode"], q.Get("ssl_mode"), q.Get("sslmode"))
+
+		configKey, err := setupCustomTLS(u.Hostname(), requestedTLS, sslCA, sslCert, sslKey)
+		if err != nil {
+			return "", err
+		}
+
+		q.Set("tls", configKey)
+		for _, opt := range customTLSOptions {
+			q.Del(opt)
+		}
+		q.Del("ssl_mode")
+		q.Del("sslmode")
+		u.RawQuery = q.Encode()
+	}
+
+	// Normalize connect_timeout / timeout if passed in opts or query without unit
+	if to := firstNonEmpty(opts["timeout"], opts["connect_timeout"]); to != "" && q.Get("timeout") == "" {
+		if _, err := strconv.Atoi(to); err == nil {
+			to += "s"
+		}
+		q.Set("timeout", to)
+		u.RawQuery = q.Encode()
+	}
+	if t := q.Get("timeout"); t != "" {
+		if _, err := strconv.Atoi(t); err == nil {
+			q.Set("timeout", t+"s")
+			u.RawQuery = q.Encode()
+		}
+	}
+
 	dsn := cfg.FormatDSN()
 	if u.RawQuery != "" {
 		if autocommit != "" {
@@ -201,7 +382,7 @@ func (f *SingleStoreDBFactory) parseToSingleStoreDSN(singlestoreURI, username, p
 }
 
 // buildFromNativeDSN handles SingleStore's native DSN format and plain host strings.
-func (f *SingleStoreDBFactory) buildFromNativeDSN(baseURI, username, password, autocommit string) (string, error) {
+func (f *SingleStoreDBFactory) buildFromNativeDSN(baseURI, username, password, autocommit string, opts map[string]string) (string, error) {
 	var cfg *mysql.Config
 	var err error
 
@@ -231,6 +412,30 @@ func (f *SingleStoreDBFactory) buildFromNativeDSN(baseURI, username, password, a
 			cfg.Params = make(map[string]string)
 		}
 		cfg.Params["autocommit"] = autocommit
+	}
+
+	if to := firstNonEmpty(opts["timeout"], opts["connect_timeout"]); to != "" {
+		if d, err := time.ParseDuration(to); err == nil {
+			cfg.Timeout = d
+		} else if s, err := strconv.Atoi(to); err == nil {
+			cfg.Timeout = time.Duration(s) * time.Second
+		}
+	}
+
+	if hasCustomTLSOptions(opts, nil) {
+		sslCA := firstNonEmpty(opts["ssl_ca"], opts["sslrootcert"])
+		sslCert := opts["ssl_cert"]
+		sslKey := opts["ssl_key"]
+		requestedTLS := firstNonEmpty(opts["ssl_mode"], opts["sslmode"], cfg.TLSConfig)
+		tlsHost := ""
+		if cfg.Net != "unix" {
+			tlsHost = normalizeTLSHostname(cfg.Addr)
+		}
+		configKey, err := setupCustomTLS(tlsHost, requestedTLS, sslCA, sslCert, sslKey)
+		if err != nil {
+			return "", err
+		}
+		cfg.TLSConfig = configKey
 	}
 
 	return cfg.FormatDSN(), nil

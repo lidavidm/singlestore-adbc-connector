@@ -18,12 +18,21 @@ package singlestore_test
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"database/sql"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/adbc-drivers/driverbase-go/driverbase"
 	"github.com/adbc-drivers/driverbase-go/validation"
@@ -1860,4 +1869,557 @@ func TestURIParsing(t *testing.T) {
 			assert.Equal(t, tt.expectedDSN, result, "DSN should match expected value")
 		})
 	}
+}
+
+func createTempCertAndKey(t *testing.T) (string, string) {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			Organization: []string{"SingleStore Test"},
+			CommonName:   "localhost",
+		},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	require.NoError(t, err)
+
+	certOut, err := os.CreateTemp("", "test_cert_*.pem")
+	require.NoError(t, err)
+	defer func() { _ = certOut.Close() }()
+	err = pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	require.NoError(t, err)
+
+	keyBytes, err := x509.MarshalECPrivateKey(priv)
+	require.NoError(t, err)
+	keyOut, err := os.CreateTemp("", "test_key_*.pem")
+	require.NoError(t, err)
+	defer func() { _ = keyOut.Close() }()
+	err = pem.Encode(keyOut, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes})
+	require.NoError(t, err)
+
+	return certOut.Name(), keyOut.Name()
+}
+
+func TestCustomTLS(t *testing.T) {
+	factory := singlestore.NewSingleStoreDBFactory()
+	certFile, keyFile := createTempCertAndKey(t)
+	defer func() { _ = os.Remove(certFile) }()
+	defer func() { _ = os.Remove(keyFile) }()
+
+	t.Run("valid_ca_in_uri", func(t *testing.T) {
+		opts := map[string]string{
+			adbc.OptionKeyURI: fmt.Sprintf("mysql://user:pass@localhost:3306/testdb?ssl_ca=%s&tls=verify_ca", url.QueryEscape(certFile)),
+		}
+		dsn, err := factory.BuildSingleStoreDSN(opts)
+		require.NoError(t, err)
+		assert.Contains(t, dsn, "tls=custom_ca_")
+		assert.NotContains(t, dsn, "ssl_ca=")
+	})
+
+	t.Run("valid_ca_in_opts", func(t *testing.T) {
+		opts := map[string]string{
+			adbc.OptionKeyURI: "mysql://user:pass@localhost:3306/testdb",
+			"ssl_ca":          certFile,
+			"ssl_mode":        "verify_ca",
+		}
+		dsn, err := factory.BuildSingleStoreDSN(opts)
+		require.NoError(t, err)
+		assert.Contains(t, dsn, "tls=custom_ca_")
+		assert.NotContains(t, dsn, "ssl_ca=")
+	})
+
+	t.Run("valid_client_cert_and_key", func(t *testing.T) {
+		opts := map[string]string{
+			adbc.OptionKeyURI: "mysql://user:pass@localhost:3306/testdb",
+			"ssl_ca":          certFile,
+			"ssl_cert":        certFile,
+			"ssl_key":         keyFile,
+		}
+		dsn, err := factory.BuildSingleStoreDSN(opts)
+		require.NoError(t, err)
+		assert.Contains(t, dsn, "tls=custom_ca_")
+	})
+
+	t.Run("missing_ca_file_errors", func(t *testing.T) {
+		opts := map[string]string{
+			adbc.OptionKeyURI: "mysql://user:pass@localhost:3306/testdb?ssl_ca=/nonexistent/path/ca.pem",
+		}
+		_, err := factory.BuildSingleStoreDSN(opts)
+		require.ErrorContains(t, err, "failed to read ssl_ca file")
+	})
+
+	t.Run("invalid_ca_pem_errors", func(t *testing.T) {
+		badFile, err := os.CreateTemp("", "bad_ca_*.pem")
+		require.NoError(t, err)
+		defer func() { _ = os.Remove(badFile.Name()) }()
+		_, _ = badFile.WriteString("this is not a valid pem certificate")
+		require.NoError(t, badFile.Close())
+
+		opts := map[string]string{
+			adbc.OptionKeyURI: "mysql://user:pass@localhost:3306/testdb?ssl_ca=" + badFile.Name(),
+		}
+		_, err = factory.BuildSingleStoreDSN(opts)
+		require.ErrorContains(t, err, "failed to parse root certificates")
+	})
+
+	t.Run("cert_without_key_errors", func(t *testing.T) {
+		opts := map[string]string{
+			adbc.OptionKeyURI: "mysql://user:pass@localhost:3306/testdb?ssl_cert=" + certFile,
+		}
+		_, err := factory.BuildSingleStoreDSN(opts)
+		require.ErrorContains(t, err, "both ssl_cert and ssl_key must be provided")
+	})
+
+	t.Run("ssl_ca_with_disabled_mode_errors", func(t *testing.T) {
+		opts := map[string]string{
+			adbc.OptionKeyURI: fmt.Sprintf("mysql://user:pass@localhost:3306/testdb?ssl_ca=%s&tls=false", url.QueryEscape(certFile)),
+		}
+		_, err := factory.BuildSingleStoreDSN(opts)
+		require.ErrorContains(t, err, `custom TLS options (ssl_ca, ssl_cert, ssl_key) cannot be used when TLS is disabled (tls="false")`)
+	})
+
+	t.Run("postgres_style_sslmode_aliases", func(t *testing.T) {
+		_, tlsVerifyCA, err := singlestore.BuildCustomTLSConfig("other.example.com", "verify-ca", certFile, "", "")
+		require.NoError(t, err)
+		assert.True(t, tlsVerifyCA.InsecureSkipVerify, "verify-ca should skip standard hostname check and use VerifyPeerCertificate")
+		assert.NotNil(t, tlsVerifyCA.VerifyPeerCertificate, "verify-ca must set VerifyPeerCertificate for CA-only verification")
+
+		_, tlsRequire, err := singlestore.BuildCustomTLSConfig("other.example.com", "require", certFile, "", "")
+		require.NoError(t, err)
+		assert.True(t, tlsRequire.InsecureSkipVerify, "require should encrypt without verifying peer certificate or hostname")
+		assert.Nil(t, tlsRequire.VerifyPeerCertificate, "require must not install VerifyPeerCertificate")
+	})
+
+	t.Run("timeout_normalized_with_unit", func(t *testing.T) {
+		opts := map[string]string{
+			adbc.OptionKeyURI: "mysql://user:pass@localhost:3306/testdb?timeout=15",
+		}
+		dsn, err := factory.BuildSingleStoreDSN(opts)
+		require.NoError(t, err)
+		assert.Contains(t, dsn, "timeout=15s")
+	})
+
+	t.Run("native_dsn_tls_strips_port_from_server_name", func(t *testing.T) {
+		uriDSN, err := factory.BuildSingleStoreDSN(map[string]string{
+			adbc.OptionKeyURI: "mysql://user:pass@myhost.example.com:3306/testdb",
+			"ssl_ca":          certFile,
+			"ssl_mode":        "verify_full",
+		})
+		require.NoError(t, err)
+
+		nativeDSN, err := factory.BuildSingleStoreDSN(map[string]string{
+			adbc.OptionKeyURI: "user:pass@tcp(myhost.example.com:3306)/testdb",
+			"ssl_ca":          certFile,
+			"ssl_mode":        "verify_full",
+		})
+		require.NoError(t, err)
+		assert.Equal(t, uriDSN, nativeDSN, "URI and native DSN must register the same custom_ca key without port")
+
+		_, tlsCfg, err := singlestore.BuildCustomTLSConfig("myhost.example.com:3306", "verify_full", certFile, "", "")
+		require.NoError(t, err)
+		assert.Equal(t, "myhost.example.com", tlsCfg.ServerName)
+		assert.False(t, tlsCfg.InsecureSkipVerify)
+	})
+
+	t.Run("native_dsn_standalone_timeout_options", func(t *testing.T) {
+		dsn, err := factory.BuildSingleStoreDSN(map[string]string{
+			adbc.OptionKeyURI: "user:pass@tcp(localhost:3306)/testdb",
+			"timeout":         "15",
+		})
+		require.NoError(t, err)
+		assert.Contains(t, dsn, "timeout=15s")
+
+		dsnConnect, err := factory.BuildSingleStoreDSN(map[string]string{
+			adbc.OptionKeyURI: "user:pass@tcp(localhost:3306)/testdb",
+			"connect_timeout": "20s",
+		})
+		require.NoError(t, err)
+		assert.Contains(t, dsnConnect, "timeout=20s")
+	})
+
+	t.Run("verify_ca_without_custom_ca_still_verifies_server_cert", func(t *testing.T) {
+		_, tlsCfg, err := singlestore.BuildCustomTLSConfig("localhost", "verify_ca", "", certFile, keyFile)
+		require.NoError(t, err)
+		require.NotNil(t, tlsCfg.VerifyPeerCertificate, "verify_ca must always install VerifyPeerCertificate even without ssl_ca")
+
+		pemBytes, err := os.ReadFile(certFile)
+		require.NoError(t, err)
+		block, _ := pem.Decode(pemBytes)
+		require.NotNil(t, block)
+
+		// Self-signed cert is not in the system root pool, so VerifyPeerCertificate must reject it
+		err = tlsCfg.VerifyPeerCertificate([][]byte{block.Bytes}, nil)
+		require.Error(t, err)
+
+		// When ssl_ca is provided, the same cert is trusted even with a mismatched hostname
+		_, tlsCfgWithCA, err := singlestore.BuildCustomTLSConfig("other.example.com", "verify_ca", certFile, certFile, keyFile)
+		require.NoError(t, err)
+		require.NotNil(t, tlsCfgWithCA.VerifyPeerCertificate)
+		require.NoError(t, tlsCfgWithCA.VerifyPeerCertificate([][]byte{block.Bytes}, nil))
+	})
+}
+
+func TestSingleStoreHardening(t *testing.T) {
+	withQuirks(t, func(q *SingleStoreQuirks) {
+		ctx := context.Background()
+		drv := q.SetupDriver(t)
+		defer q.TearDownDriver(t, drv)
+
+		db, err := drv.NewDatabaseWithContext(ctx, q.DatabaseOptions())
+		require.NoError(t, err)
+		defer func() { _ = db.Close(ctx) }()
+
+		conn, err := db.Open(ctx)
+		require.NoError(t, err)
+		defer func() { _ = conn.Close(ctx) }()
+
+		stmt, err := conn.NewStatement(ctx)
+		require.NoError(t, err)
+		defer func() { _ = stmt.Close(ctx) }()
+
+		t.Run("unsigned_integers", func(t *testing.T) {
+			rawDB, err := sql.Open("mysql", q.dsn)
+			require.NoError(t, err)
+			defer func() { _ = rawDB.Close() }()
+
+			_, _ = rawDB.Exec("DROP TABLE IF EXISTS test_uints")
+			_, err = rawDB.Exec("CREATE TABLE test_uints (u8 TINYINT UNSIGNED, u16 SMALLINT UNSIGNED, u32 INT UNSIGNED, u64 BIGINT UNSIGNED)")
+			require.NoError(t, err)
+			defer func() { _, _ = rawDB.Exec("DROP TABLE IF EXISTS test_uints") }()
+
+			_, err = rawDB.Exec("INSERT INTO test_uints VALUES (255, 65535, 4294967295, 18446744073709551615)")
+			require.NoError(t, err)
+
+			require.NoError(t, stmt.SetSqlQuery(ctx, "SELECT u8, u16, u32, u64 FROM test_uints"))
+			r, _, err := stmt.ExecuteQuery(ctx)
+			require.NoError(t, err)
+			defer r.Release()
+
+			require.True(t, r.Next())
+			rec := r.RecordBatch()
+			schema := rec.Schema()
+			assert.Equal(t, arrow.PrimitiveTypes.Uint8.ID(), schema.Field(0).Type.ID())
+			assert.Equal(t, arrow.PrimitiveTypes.Uint16.ID(), schema.Field(1).Type.ID())
+			assert.Equal(t, arrow.PrimitiveTypes.Uint32.ID(), schema.Field(2).Type.ID())
+			assert.Equal(t, arrow.PrimitiveTypes.Uint64.ID(), schema.Field(3).Type.ID())
+
+			assert.Equal(t, uint8(255), rec.Column(0).(*array.Uint8).Value(0))
+			assert.Equal(t, uint16(65535), rec.Column(1).(*array.Uint16).Value(0))
+			assert.Equal(t, uint32(4294967295), rec.Column(2).(*array.Uint32).Value(0))
+			assert.Equal(t, uint64(18446744073709551615), rec.Column(3).(*array.Uint64).Value(0))
+		})
+
+		t.Run("time_range_never_wraps", func(t *testing.T) {
+			require.NoError(t, stmt.SetSqlQuery(ctx, "SELECT CAST('838:59:59' AS TIME) as t_pos, CAST('-838:59:59' AS TIME) as t_neg"))
+			r, _, err := stmt.ExecuteQuery(ctx)
+			require.NoError(t, err)
+			defer r.Release()
+
+			require.True(t, r.Next())
+			rec := r.RecordBatch()
+			assert.Equal(t, arrow.FixedWidthTypes.Time32s.ID(), rec.Schema().Field(0).Type.ID())
+			col0 := rec.Column(0).(*array.Time32)
+			col1 := rec.Column(1).(*array.Time32)
+			assert.Equal(t, arrow.Time32(3020399), col0.Value(0))
+			assert.Equal(t, arrow.Time32(-3020399), col1.Value(0))
+		})
+
+		t.Run("statement_cancel_stops_server_query", func(t *testing.T) {
+			s2, err := conn.NewStatement(ctx)
+			require.NoError(t, err)
+			defer func() { _ = s2.Close(ctx) }()
+
+			start := time.Now()
+			require.NoError(t, s2.SetSqlQuery(ctx, "SELECT SLEEP(5)"))
+			go func() {
+				time.Sleep(200 * time.Millisecond)
+				if c, ok := s2.(interface{ Cancel(context.Context) error }); ok {
+					_ = c.Cancel(ctx)
+				}
+			}()
+
+			r, _, err := s2.ExecuteQuery(ctx)
+			if err == nil && r != nil {
+				defer r.Release()
+				require.False(t, r.Next(), "Next should return false after cancellation")
+				err = r.Err()
+			}
+			elapsed := time.Since(start)
+			require.Error(t, err, "query should be cancelled")
+			assert.Contains(t, err.Error(), "interrupted")
+			assert.Less(t, elapsed, 3*time.Second, "query should stop quickly when cancelled")
+		})
+
+		t.Run("cancel_idle_connection", func(t *testing.T) {
+			require.NoError(t, singlestore.CancelConnection(conn, ctx))
+
+			s, err := conn.NewStatement(ctx)
+			require.NoError(t, err)
+			defer func() { _ = s.Close(ctx) }()
+			sCanceller, ok := s.(interface{ Cancel(context.Context) error })
+			require.True(t, ok)
+			require.NoError(t, sCanceller.Cancel(ctx))
+		})
+
+		t.Run("cancel_after_session_gone", func(t *testing.T) {
+			conn2, err := db.Open(ctx)
+			require.NoError(t, err)
+			defer func() { _ = conn2.Close(ctx) }()
+
+			s2, err := conn2.NewStatement(ctx)
+			require.NoError(t, err)
+			defer func() { _ = s2.Close(ctx) }()
+			require.NoError(t, s2.SetSqlQuery(ctx, "SELECT CONNECTION_ID()"))
+			r, _, err := s2.ExecuteQuery(ctx)
+			require.NoError(t, err)
+			defer r.Release()
+			require.True(t, r.Next())
+			rec := r.RecordBatch()
+			var victimID uint64
+			if col := rec.Column(0); col != nil {
+				switch c := col.(type) {
+				case *array.Uint64:
+					victimID = c.Value(0)
+				case *array.Int64:
+					victimID = uint64(c.Value(0))
+				case *array.Uint32:
+					victimID = uint64(c.Value(0))
+				case *array.Int32:
+					victimID = uint64(c.Value(0))
+				}
+			}
+			require.NotZero(t, victimID)
+
+			rawDB, err := sql.Open("mysql", q.dsn)
+			require.NoError(t, err)
+			defer func() { _ = rawDB.Close() }()
+
+			_, err = rawDB.Exec(fmt.Sprintf("KILL %d", victimID))
+			require.NoError(t, err)
+
+			require.NoError(t, singlestore.CancelConnection(conn2, ctx))
+
+			sCanceller, ok := s2.(interface{ Cancel(context.Context) error })
+			require.True(t, ok)
+			require.NoError(t, sCanceller.Cancel(ctx))
+		})
+
+		t.Run("connection_registry_cleanup_on_close", func(t *testing.T) {
+			initial := singlestore.ConnectionRegistryLen()
+			const n = 5
+			conns := make([]adbc.ConnectionWithContext, n)
+			for i := 0; i < n; i++ {
+				c, err := db.Open(ctx)
+				require.NoError(t, err)
+				conns[i] = c
+			}
+			assert.Equal(t, initial+n, singlestore.ConnectionRegistryLen(), "registry must contain N open connections")
+			for i := 0; i < n; i++ {
+				require.NoError(t, conns[i].Close(ctx))
+			}
+			assert.Equal(t, initial, singlestore.ConnectionRegistryLen(), "registry must return to initial size after all connections closed")
+		})
+
+		t.Run("cancel_after_close", func(t *testing.T) {
+			// 1. Connection Cancel after Close = StatusInvalidState
+			conn1, err := db.Open(ctx)
+			require.NoError(t, err)
+			s1, err := conn1.NewStatement(ctx)
+			require.NoError(t, err)
+			defer func() { _ = s1.Close(ctx) }()
+
+			require.NoError(t, conn1.Close(ctx))
+
+			err = singlestore.CancelConnection(conn1, ctx)
+			require.Error(t, err)
+			var adbcErr adbc.Error
+			require.True(t, errors.As(err, &adbcErr), "CancelConnection after Close must return adbc.Error")
+			assert.Equal(t, adbc.StatusInvalidState, adbcErr.Code)
+
+			// 2. Statement Cancel after conn Close = StatusInvalidState and no KILL sent
+			// Start a second session running a sleep query
+			conn2, err := db.Open(ctx)
+			require.NoError(t, err)
+			defer func() { _ = conn2.Close(ctx) }()
+
+			s2, err := conn2.NewStatement(ctx)
+			require.NoError(t, err)
+			defer func() { _ = s2.Close(ctx) }()
+			require.NoError(t, s2.SetSqlQuery(ctx, "SELECT SLEEP(2)"))
+
+			sleepStarted := make(chan struct{})
+			sleepDone := make(chan error, 1)
+			go func() {
+				close(sleepStarted)
+				r, _, err := s2.ExecuteQuery(ctx)
+				if err == nil && r != nil {
+					defer r.Release()
+					for r.Next() {
+					}
+					err = r.Err()
+				}
+				sleepDone <- err
+			}()
+
+			<-sleepStarted
+			time.Sleep(100 * time.Millisecond) // Ensure sleep query is actively executing on server
+
+			// Cancel statement s1 whose connection conn1 is closed
+			s1Canceller, ok := s1.(interface{ Cancel(context.Context) error })
+			require.True(t, ok)
+			err = s1Canceller.Cancel(ctx)
+			require.Error(t, err)
+			require.True(t, errors.As(err, &adbcErr), "Statement Cancel after conn Close must return adbc.Error")
+			assert.Equal(t, adbc.StatusInvalidState, adbcErr.Code)
+
+			// Wait for sleep to finish cleanly without being killed
+			select {
+			case sleepErr := <-sleepDone:
+				assert.NoError(t, sleepErr, "second session's query must not be killed")
+			case <-time.After(4 * time.Second):
+				t.Fatal("timed out waiting for second session sleep query")
+			}
+		})
+	})
+}
+
+func TestConvertToUintRangeChecked(t *testing.T) {
+	// uint8 checks
+	u8, err := singlestore.ConvertToUintRangeChecked[uint8](uint8(255))
+	require.NoError(t, err)
+	assert.Equal(t, uint8(255), u8)
+
+	u8, err = singlestore.ConvertToUintRangeChecked[uint8]("255")
+	require.NoError(t, err)
+	assert.Equal(t, uint8(255), u8)
+
+	u8, err = singlestore.ConvertToUintRangeChecked[uint8]([]byte("255"))
+	require.NoError(t, err)
+	assert.Equal(t, uint8(255), u8)
+
+	_, err = singlestore.ConvertToUintRangeChecked[uint8](int64(-1))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "negative")
+
+	_, err = singlestore.ConvertToUintRangeChecked[uint8](uint64(256))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "overflows")
+
+	_, err = singlestore.ConvertToUintRangeChecked[uint8]("256")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "overflows")
+
+	_, err = singlestore.ConvertToUintRangeChecked[uint8](float64(10.5))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "without truncation")
+
+	// uint16 checks
+	u16, err := singlestore.ConvertToUintRangeChecked[uint16](uint16(65535))
+	require.NoError(t, err)
+	assert.Equal(t, uint16(65535), u16)
+
+	_, err = singlestore.ConvertToUintRangeChecked[uint16](int32(-10))
+	require.Error(t, err)
+
+	_, err = singlestore.ConvertToUintRangeChecked[uint16](uint64(65536))
+	require.Error(t, err)
+
+	// uint32 checks
+	u32, err := singlestore.ConvertToUintRangeChecked[uint32](uint32(4294967295))
+	require.NoError(t, err)
+	assert.Equal(t, uint32(4294967295), u32)
+
+	_, err = singlestore.ConvertToUintRangeChecked[uint32](int64(4294967296))
+	require.Error(t, err)
+
+	// uint64 checks
+	u64, err := singlestore.ConvertToUintRangeChecked[uint64](uint64(18446744073709551615))
+	require.NoError(t, err)
+	assert.Equal(t, uint64(18446744073709551615), u64)
+
+	_, err = singlestore.ConvertToUintRangeChecked[uint64](int64(-1))
+	require.Error(t, err)
+
+	_, err = singlestore.ConvertToUintRangeChecked[uint64](float32(1.0))
+	require.Error(t, err)
+}
+
+func TestTimeRangeParsing(t *testing.T) {
+	// In-range values
+	t32, err := singlestore.Time32FromString("838:59:59")
+	require.NoError(t, err)
+	assert.Equal(t, arrow.Time32(3020399), t32)
+
+	t32, err = singlestore.Time32FromString("-838:59:59")
+	require.NoError(t, err)
+	assert.Equal(t, arrow.Time32(-3020399), t32)
+
+	t64, err := singlestore.Time64FromString("838:00:59.000001")
+	require.NoError(t, err)
+	assert.Equal(t, arrow.Time64(3016859000001), t64)
+
+	t64, err = singlestore.Time64FromString("-838:00:59.000001")
+	require.NoError(t, err)
+	assert.Equal(t, arrow.Time64(-3016859000001), t64)
+
+	t64, err = singlestore.Time64FromString("838:58:59.999999")
+	require.NoError(t, err)
+	assert.Equal(t, arrow.Time64(3020339999999), t64)
+
+	t64, err = singlestore.Time64FromString("-838:58:59.999999")
+	require.NoError(t, err)
+	assert.Equal(t, arrow.Time64(-3020339999999), t64)
+
+	t64, err = singlestore.Time64FromString("838:59:59")
+	require.NoError(t, err)
+	assert.Equal(t, arrow.Time64(3020399000000), t64)
+
+	t64, err = singlestore.Time64FromString("-838:59:59")
+	require.NoError(t, err)
+	assert.Equal(t, arrow.Time64(-3020399000000), t64)
+
+	// Out-of-range values
+	_, err = singlestore.Time32FromString("839:00:00")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "out of range")
+
+	_, err = singlestore.Time32FromString("-839:00:00")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "out of range")
+
+	_, err = singlestore.Time32FromString("12:60:00")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "out of range")
+
+	_, err = singlestore.Time64FromString("839:00:00")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "out of range")
+
+	_, err = singlestore.Time64FromString("838:59:59.000001")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "out of range")
+
+	_, err = singlestore.Time64FromString("-838:59:59.000001")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "out of range")
+
+	// Overflow protection (huge hours that wrap int64 if multiplied first)
+	_, err = singlestore.Time32FromString("9223372036854775807:00:00")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "out of range")
+
+	_, err = singlestore.Time64FromString("9223372036854775807:00:00")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "out of range")
+
+	_, err = singlestore.Time32FromString("invalid")
+	require.Error(t, err)
 }

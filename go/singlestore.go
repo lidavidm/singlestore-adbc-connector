@@ -17,11 +17,16 @@ package singlestore
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/adbc-drivers/driverbase-go/driverbase"
@@ -32,8 +37,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/extensions"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/go-ext/variant"
-	// register the "mysql" driver with database/sql
-	_ "github.com/memsql/go-singlestore-driver"
+	mysql "github.com/memsql/go-singlestore-driver"
 )
 
 // singlestoreTypeConverter provides SingleStore-specific type conversion enhancements
@@ -41,8 +45,27 @@ type singlestoreTypeConverter struct {
 	sqlwrapper.DefaultTypeConverter
 }
 
+func normalizeDatabaseTypeName(raw string) string {
+	raw = strings.ToUpper(strings.TrimSpace(raw))
+	switch raw {
+	case "UNSIGNED TINYINT":
+		return "TINYINT UNSIGNED"
+	case "UNSIGNED SMALLINT":
+		return "SMALLINT UNSIGNED"
+	case "UNSIGNED MEDIUMINT":
+		return "MEDIUMINT UNSIGNED"
+	case "UNSIGNED INT", "UNSIGNED INTEGER":
+		return "INT UNSIGNED"
+	case "UNSIGNED BIGINT":
+		return "BIGINT UNSIGNED"
+	default:
+		return raw
+	}
+}
+
 // ConvertRawColumnType implements TypeConverter with SingleStore-specific enhancements
 func (m *singlestoreTypeConverter) ConvertRawColumnType(colType sqlwrapper.ColumnType) (arrow.DataType, bool, arrow.Metadata, error) {
+	colType.DatabaseTypeName = normalizeDatabaseTypeName(colType.DatabaseTypeName)
 	typeName := strings.ToUpper(colType.DatabaseTypeName)
 	nullable := colType.Nullable
 
@@ -194,6 +217,14 @@ func (m *singlestoreTypeConverter) ConvertRawColumnType(colType sqlwrapper.Colum
 func (m *singlestoreTypeConverter) CreateInserter(field *arrow.Field, builder array.Builder) (sqlwrapper.Inserter, error) {
 	// Check for SingleStore-specific types first
 	switch field.Type.(type) {
+	case *arrow.Uint8Type:
+		return &singlestoreUintInserter[uint8, *array.Uint8Builder]{builder: builder.(*array.Uint8Builder)}, nil
+	case *arrow.Uint16Type:
+		return &singlestoreUintInserter[uint16, *array.Uint16Builder]{builder: builder.(*array.Uint16Builder)}, nil
+	case *arrow.Uint32Type:
+		return &singlestoreUintInserter[uint32, *array.Uint32Builder]{builder: builder.(*array.Uint32Builder)}, nil
+	case *arrow.Uint64Type:
+		return &singlestoreUintInserter[uint64, *array.Uint64Builder]{builder: builder.(*array.Uint64Builder)}, nil
 	case *extensions.JSONType:
 		return &singlestoreJSONInserter{builder: builder}, nil
 	case *arrow.BinaryType:
@@ -213,6 +244,111 @@ func (m *singlestoreTypeConverter) CreateInserter(field *arrow.Field, builder ar
 		// For all other types, use default inserter
 		return m.DefaultTypeConverter.CreateInserter(field, builder)
 	}
+}
+
+type uintType interface {
+	~uint8 | ~uint16 | ~uint32 | ~uint64
+}
+
+type uintBuilder[T uintType] interface {
+	Append(T)
+	AppendNull()
+}
+
+type singlestoreUintInserter[T uintType, B uintBuilder[T]] struct {
+	builder B
+}
+
+func (ins *singlestoreUintInserter[T, B]) AppendValue(sqlValue any) error {
+	unwrapped, err := unwrap(sqlValue)
+	if err != nil {
+		return err
+	}
+	if unwrapped == nil {
+		ins.builder.AppendNull()
+		return nil
+	}
+	val, err := convertToUintRangeChecked[T](unwrapped)
+	if err != nil {
+		return err
+	}
+	ins.builder.Append(val)
+	return nil
+}
+
+func convertToUintRangeChecked[T uintType](val any) (T, error) {
+	var zero T
+	var maxVal uint64
+	switch any(zero).(type) {
+	case uint8:
+		maxVal = math.MaxUint8
+	case uint16:
+		maxVal = math.MaxUint16
+	case uint32:
+		maxVal = math.MaxUint32
+	case uint64:
+		maxVal = math.MaxUint64
+	}
+
+	var u uint64
+	switch v := val.(type) {
+	case uint64:
+		u = v
+	case uint:
+		u = uint64(v)
+	case uint32:
+		u = uint64(v)
+	case uint16:
+		u = uint64(v)
+	case uint8:
+		u = uint64(v)
+	case int64:
+		if v < 0 {
+			return zero, fmt.Errorf("cannot convert negative integer %d to unsigned type %T", v, zero)
+		}
+		u = uint64(v)
+	case int:
+		if v < 0 {
+			return zero, fmt.Errorf("cannot convert negative integer %d to unsigned type %T", v, zero)
+		}
+		u = uint64(v)
+	case int32:
+		if v < 0 {
+			return zero, fmt.Errorf("cannot convert negative integer %d to unsigned type %T", v, zero)
+		}
+		u = uint64(v)
+	case int16:
+		if v < 0 {
+			return zero, fmt.Errorf("cannot convert negative integer %d to unsigned type %T", v, zero)
+		}
+		u = uint64(v)
+	case int8:
+		if v < 0 {
+			return zero, fmt.Errorf("cannot convert negative integer %d to unsigned type %T", v, zero)
+		}
+		u = uint64(v)
+	case []byte:
+		parsed, err := strconv.ParseUint(string(v), 10, 64)
+		if err != nil {
+			return zero, fmt.Errorf("cannot parse %T from []byte %q: %w", zero, string(v), err)
+		}
+		u = parsed
+	case string:
+		parsed, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			return zero, fmt.Errorf("cannot parse %T from string %q: %w", zero, v, err)
+		}
+		u = parsed
+	case float64, float32:
+		return zero, fmt.Errorf("cannot convert float %v to integer type %T without truncation", val, zero)
+	default:
+		return zero, fmt.Errorf("cannot convert %T to %T", val, zero)
+	}
+
+	if u > maxVal {
+		return zero, fmt.Errorf("value %d overflows %T (maximum %d)", u, zero, maxVal)
+	}
+	return T(u), nil
 }
 
 // SingleStore-specific inserters
@@ -309,11 +445,21 @@ func time64FromString(timeStr string) (arrow.Time64, error) {
 		}
 	}
 
+	if hours < 0 || hours > 838 || minutes < 0 || seconds < 0 || microseconds < 0 ||
+		minutes >= 60 || seconds >= 60 {
+		return 0, fmt.Errorf("time value out of range [-838:59:59, 838:59:59]: %s", timeStr)
+	}
+
 	// Calculate total microseconds
 	totalMicroseconds := (hours * 3600000000) +
 		(minutes * 60000000) +
 		(seconds * 1000000) +
 		microseconds
+
+	const maxTime64Microseconds = int64(838*3600+59*60+59) * 1000000 // 3020399000000
+	if totalMicroseconds > maxTime64Microseconds {
+		return 0, fmt.Errorf("time value out of range [-838:59:59, 838:59:59]: %s", timeStr)
+	}
 
 	// Reapply negative sign
 	if isNegative {
@@ -402,8 +548,17 @@ func time32FromString(timeStr string) (arrow.Time32, error) {
 		return 0, fmt.Errorf("error parsing seconds: %w", err)
 	}
 
+	if hours < 0 || hours > 838 || minutes < 0 || seconds < 0 ||
+		minutes >= 60 || seconds >= 60 {
+		return 0, fmt.Errorf("time value out of range [-838:59:59, 838:59:59]: %s", timeStr)
+	}
+
 	// Calculate total seconds (Hours * 3600 + Minutes * 60 + Seconds)
 	totalSeconds := (hours * 3600) + (minutes * 60) + seconds
+	const maxTime32Seconds = int64(838*3600 + 59*60 + 59) // 3020399
+	if totalSeconds > maxTime32Seconds {
+		return 0, fmt.Errorf("time value out of range [-838:59:59, 838:59:59]: %s", timeStr)
+	}
 
 	// Reapply the negative sign if the original string was negative
 	if isNegative {
@@ -648,7 +803,110 @@ func formatSingleStoreTimeInMicros(t int64) string {
 type singlestoreConnectionImpl struct {
 	*sqlwrapper.ConnectionImplBase // Embed sqlwrapper connection for all standard functionality
 
-	version string
+	version      string
+	connID       atomic.Uint64
+	aggregatorID atomic.Int64
+}
+
+func (c *singlestoreConnectionImpl) Cancel(ctx context.Context) error {
+	connID := c.connID.Load()
+	if c.Db == nil || connID == 0 {
+		return c.ErrorHelper.InvalidState("cannot cancel: connection is closed or connection ID is not available")
+	}
+	// Note: sqlwrapper.ExecuteQuery uses context.Background() so that context cancellation
+	// does not close the pinned *sql.Conn. We therefore issue KILL QUERY <conn_id> <node_id>
+	// directly over a separate pool connection (matching go-singlestore-driver's killQuery).
+	var killQuery string
+	if aggID := c.aggregatorID.Load(); aggID > 0 {
+		killQuery = fmt.Sprintf("KILL QUERY %d %d", connID, aggID)
+	} else {
+		killQuery = fmt.Sprintf("KILL QUERY %d", connID)
+	}
+	_, err := c.Db.ExecContext(ctx, killQuery)
+	if err != nil {
+		var myErr *mysql.MySQLError
+		if errors.As(err, &myErr) && myErr.Number == 1094 {
+			return nil
+		}
+		return c.ErrorHelper.WrapIO(err, "failed to kill query on connection %d", connID)
+	}
+	return nil
+}
+
+func (c *singlestoreConnectionImpl) NewStatement(ctx context.Context) (adbc.StatementWithContext, error) {
+	stmt, err := c.ConnectionImplBase.NewStatement(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &singlestoreStatement{
+		StatementWithContext: stmt,
+		conn:                 c,
+	}, nil
+}
+
+type singlestoreStatement struct {
+	adbc.StatementWithContext
+	conn *singlestoreConnectionImpl
+}
+
+func (s *singlestoreStatement) Cancel(ctx context.Context) error {
+	return s.conn.Cancel(ctx)
+}
+
+func (s *singlestoreStatement) GetOption(ctx context.Context, key string) (string, error) {
+	if opts, ok := s.StatementWithContext.(adbc.GetSetOptionsWithContext); ok {
+		return opts.GetOption(ctx, key)
+	}
+	return "", adbc.Error{Code: adbc.StatusNotImplemented}
+}
+
+func (s *singlestoreStatement) GetOptionBytes(ctx context.Context, key string) ([]byte, error) {
+	if opts, ok := s.StatementWithContext.(adbc.GetSetOptionsWithContext); ok {
+		return opts.GetOptionBytes(ctx, key)
+	}
+	return nil, adbc.Error{Code: adbc.StatusNotImplemented}
+}
+
+func (s *singlestoreStatement) GetOptionDouble(ctx context.Context, key string) (float64, error) {
+	if opts, ok := s.StatementWithContext.(adbc.GetSetOptionsWithContext); ok {
+		return opts.GetOptionDouble(ctx, key)
+	}
+	return 0, adbc.Error{Code: adbc.StatusNotImplemented}
+}
+
+func (s *singlestoreStatement) GetOptionInt(ctx context.Context, key string) (int64, error) {
+	if opts, ok := s.StatementWithContext.(adbc.GetSetOptionsWithContext); ok {
+		return opts.GetOptionInt(ctx, key)
+	}
+	return 0, adbc.Error{Code: adbc.StatusNotImplemented}
+}
+
+func (s *singlestoreStatement) SetOptionBytes(ctx context.Context, key string, val []byte) error {
+	if opts, ok := s.StatementWithContext.(adbc.GetSetOptionsWithContext); ok {
+		return opts.SetOptionBytes(ctx, key, val)
+	}
+	return adbc.Error{Code: adbc.StatusNotImplemented}
+}
+
+func (s *singlestoreStatement) SetOptionDouble(ctx context.Context, key string, val float64) error {
+	if opts, ok := s.StatementWithContext.(adbc.GetSetOptionsWithContext); ok {
+		return opts.SetOptionDouble(ctx, key, val)
+	}
+	return adbc.Error{Code: adbc.StatusNotImplemented}
+}
+
+func (s *singlestoreStatement) SetOptionInt(ctx context.Context, key string, val int64) error {
+	if opts, ok := s.StatementWithContext.(adbc.GetSetOptionsWithContext); ok {
+		return opts.SetOptionInt(ctx, key, val)
+	}
+	return adbc.Error{Code: adbc.StatusNotImplemented}
+}
+
+func (s *singlestoreStatement) ExecuteSchema(ctx context.Context) (*arrow.Schema, error) {
+	if es, ok := s.StatementWithContext.(adbc.StatementExecuteSchemaWithContext); ok {
+		return es.ExecuteSchema(ctx)
+	}
+	return nil, adbc.Error{Code: adbc.StatusNotImplemented}
 }
 
 // implements BulkIngester interface
@@ -663,6 +921,65 @@ var _ driverbase.CurrentNamespacer = (*singlestoreConnectionImpl)(nil)
 // implements TableTypeLister interface
 var _ driverbase.TableTypeLister = (*singlestoreConnectionImpl)(nil)
 
+var (
+	connectionsMu sync.RWMutex
+	connections   = make(map[*driverbase.ConnectionImplBase]*singlestoreConnectionImpl)
+)
+
+func registerConnection(base *driverbase.ConnectionImplBase, impl *singlestoreConnectionImpl) {
+	connectionsMu.Lock()
+	defer connectionsMu.Unlock()
+	connections[base] = impl
+}
+
+func unregisterConnection(base *driverbase.ConnectionImplBase) {
+	connectionsMu.Lock()
+	defer connectionsMu.Unlock()
+	delete(connections, base)
+}
+
+func (c *singlestoreConnectionImpl) Close(ctx context.Context) error {
+	defer unregisterConnection(c.Base())
+	c.connID.Swap(0)
+	c.aggregatorID.Store(0)
+	return c.ConnectionImplBase.Close(ctx)
+}
+
+func GetConnectionImpl(cnxn any) *singlestoreConnectionImpl {
+	if impl, ok := cnxn.(*singlestoreConnectionImpl); ok {
+		return impl
+	}
+	if ci, ok := cnxn.(driverbase.ConnectionImpl); ok {
+		connectionsMu.RLock()
+		defer connectionsMu.RUnlock()
+		return connections[ci.Base()]
+	}
+	return nil
+}
+
+func CancelConnection(cnxn any, ctx context.Context) error {
+	if impl := GetConnectionImpl(cnxn); impl != nil {
+		return impl.Cancel(ctx)
+	}
+	if c, ok := cnxn.(interface{ Cancel(context.Context) error }); ok {
+		return c.Cancel(ctx)
+	}
+	return adbc.Error{
+		Code: adbc.StatusInvalidState,
+		Msg:  "cannot cancel: connection is closed or not found",
+	}
+}
+
+func CancelStatement(stmt any, ctx context.Context) error {
+	if c, ok := stmt.(interface{ Cancel(context.Context) error }); ok {
+		return c.Cancel(ctx)
+	}
+	return adbc.Error{
+		Code: adbc.StatusInvalidState,
+		Msg:  "cannot cancel: statement is closed or not found",
+	}
+}
+
 // singlestoreConnectionFactory creates SingleStore connections
 type singlestoreConnectionFactory struct{}
 
@@ -671,10 +988,21 @@ func (f *singlestoreConnectionFactory) CreateConnection(
 	ctx context.Context,
 	conn *sqlwrapper.ConnectionImplBase,
 ) (sqlwrapper.ConnectionImpl, error) {
-	// Wrap the pre-built sqlwrapper connection with SingleStore-specific functionality
-	return &singlestoreConnectionImpl{
+	var connID uint64
+	var aggregatorID sql.NullInt64
+	if err := conn.Conn.QueryRowContext(ctx, "SELECT CONNECTION_ID() :> BIGINT, AGGREGATOR_ID() :> BIGINT").Scan(&connID, &aggregatorID); err != nil {
+		return nil, conn.ErrorHelper.WrapIO(err, "failed to get connection and aggregator IDs")
+	}
+
+	impl := &singlestoreConnectionImpl{
 		ConnectionImplBase: conn,
-	}, nil
+	}
+	impl.connID.Store(connID)
+	if aggregatorID.Valid {
+		impl.aggregatorID.Store(aggregatorID.Int64)
+	}
+	registerConnection(conn.Base(), impl)
+	return impl, nil
 }
 
 // NewDriver constructs the ADBC Driver for "singlestore".
