@@ -21,7 +21,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -268,10 +267,7 @@ func (f *SingleStoreDBFactory) BuildSingleStoreDSN(opts map[string]string) (stri
 func (f *SingleStoreDBFactory) parseToSingleStoreDSN(singlestoreURI, username, password, autocommit string, opts map[string]string) (string, error) {
 	u, err := url.Parse(singlestoreURI)
 	if err != nil {
-		if urlErr, ok := errors.AsType[*url.Error](err); ok {
-			err = urlErr.Err
-		}
-		return "", fmt.Errorf("invalid SingleStore URI format: %v", err)
+		return "", fmt.Errorf("invalid SingleStore URI format")
 	}
 
 	cfg := mysql.NewConfig()
