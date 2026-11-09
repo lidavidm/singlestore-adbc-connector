@@ -21,6 +21,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -265,9 +266,9 @@ func (f *SingleStoreDBFactory) BuildSingleStoreDSN(opts map[string]string) (stri
 //	mysql://user:pass@host/db?charset=utf8mb4 → user:pass@tcp(host:3306)/db?charset=utf8mb4
 //	mysql://user@(/path/to/socket.sock)/db → user@unix(/path/to/socket.sock)/db
 func (f *SingleStoreDBFactory) parseToSingleStoreDSN(singlestoreURI, username, password, autocommit string, opts map[string]string) (string, error) {
-	u, err := url.Parse(singlestoreURI)
+	u, err := safeParseURL(singlestoreURI)
 	if err != nil {
-		return "", fmt.Errorf("invalid SingleStore URI format")
+		return "", fmt.Errorf("invalid SingleStore URI format: %w", err)
 	}
 
 	cfg := mysql.NewConfig()
@@ -442,3 +443,33 @@ func (f *SingleStoreDBFactory) buildFromNativeDSN(baseURI, username, password, a
 }
 
 var _ sqlwrapper.DBFactory = (*SingleStoreDBFactory)(nil)
+
+func safeParseURL(rawURL string) (*url.URL, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		if urlErr, ok := err.(*url.Error); ok {
+			e := urlErr.Err.Error()
+			switch {
+			case strings.HasPrefix(e, "invalid URL escape "):
+				e = "invalid URL escape"
+			case strings.HasPrefix(e, "invalid character "):
+				e = "invalid character in host name"
+			case strings.HasPrefix(e, "invalid port "):
+				e = "invalid port"
+			case strings.HasPrefix(e, "invalid host: "):
+				e = "invalid host"
+			case e == "missing protocol scheme",
+				e == "net/url: invalid control character in URL",
+				e == "net/url: invalid userinfo",
+				e == "invalid IP-literal",
+				e == "missing ']' in host",
+				e == "first path segment in URL cannot contain colon":
+			default:
+				return nil, errors.New("failed to parse URL")
+			}
+			return nil, fmt.Errorf("failed to parse URL: %s", e)
+		}
+		return nil, errors.New("failed to parse URL")
+	}
+	return parsed, nil
+}

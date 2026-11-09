@@ -1635,9 +1635,9 @@ func TestInvalidURIDoesNotExposeSecrets(t *testing.T) {
 	const password = "uri-password-sentinel"
 	const token = "uri-token-sentinel"
 	for _, tc := range []struct{ name, uri, diagnostic string }{
-		{"escape", "mysql://user:" + password + "@localhost/db%zz?token=" + token, "invalid SingleStore URI format"},
-		{"port", "mysql://user:" + password + "@localhost:invalid/db?token=" + token, "invalid SingleStore URI format"},
-		{"missing userinfo separator and host", "mysql://user:" + password + "/db?token=" + token, "invalid SingleStore URI format"},
+		{"escape", "mysql://user:" + password + "@localhost/db%zz?token=" + token, "failed to parse URL: invalid URL escape"},
+		{"port", "mysql://user:" + password + "@localhost:invalid/db?token=" + token, "failed to parse URL: invalid port"},
+		{"missing userinfo separator and host", "mysql://user:" + password + "/db?token=" + token, "failed to parse URL: invalid port"},
 		{"hostname", "mysql://user:" + password + "@/db?token=" + token, "missing hostname in URI"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
