@@ -21,6 +21,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -267,6 +268,9 @@ func (f *SingleStoreDBFactory) BuildSingleStoreDSN(opts map[string]string) (stri
 func (f *SingleStoreDBFactory) parseToSingleStoreDSN(singlestoreURI, username, password, autocommit string, opts map[string]string) (string, error) {
 	u, err := url.Parse(singlestoreURI)
 	if err != nil {
+		if urlErr, ok := errors.AsType[*url.Error](err); ok {
+			err = urlErr.Err
+		}
 		return "", fmt.Errorf("invalid SingleStore URI format: %v", err)
 	}
 
@@ -305,7 +309,7 @@ func (f *SingleStoreDBFactory) parseToSingleStoreDSN(singlestoreURI, username, p
 	case "":
 		// Case 2: Empty host is invalid - hostname must be explicit
 		// Use parentheses syntax for sockets: mysql://user@(/path/to/socket)/db
-		return "", fmt.Errorf("missing hostname in URI: %s. Use explicit hostname or socket syntax: mysql://user@(socketpath)/db", singlestoreURI)
+		return "", fmt.Errorf("missing hostname in URI. Use explicit hostname or socket syntax: mysql://user@(socketpath)/db")
 
 	default:
 		// Case 3: Regular TCP connection with a hostname

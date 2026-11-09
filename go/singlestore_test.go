@@ -1631,6 +1631,29 @@ func TestSingleStoreIntegrationSuite(t *testing.T) {
 	suite.Run(t, new(SingleStoreTestSuite))
 }
 
+func TestInvalidURIDoesNotExposeSecrets(t *testing.T) {
+	const password = "uri-password-sentinel"
+	const token = "uri-token-sentinel"
+	for _, tc := range []struct{ name, uri, diagnostic string }{
+		{"escape", "mysql://user:" + password + "@localhost/db%zz?token=" + token, "invalid URL escape"},
+		{"port", "mysql://user:" + password + "@localhost:invalid/db?token=" + token, "invalid port"},
+		{"hostname", "mysql://user:" + password + "@/db?token=" + token, "missing hostname in URI"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			drv := singlestore.NewDriver(memory.DefaultAllocator)
+			db, err := drv.NewDatabaseWithContext(context.Background(), map[string]string{adbc.OptionKeyURI: tc.uri})
+			if db != nil {
+				defer func() { require.NoError(t, db.Close(context.Background())) }()
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.diagnostic)
+			assert.NotContains(t, err.Error(), password)
+			assert.NotContains(t, err.Error(), token)
+			assert.NotContains(t, err.Error(), tc.uri)
+		})
+	}
+}
+
 // TestURIParsing tests the parseToSingleStoreDSN function with various URI formats
 func TestURIParsing(t *testing.T) {
 	factory := singlestore.NewSingleStoreDBFactory()
